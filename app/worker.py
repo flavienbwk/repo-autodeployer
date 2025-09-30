@@ -8,8 +8,15 @@ from typing import List, Optional
 
 import logging
 from .queue import JobManager
-from .openai_client import generate_terraform_from_llm
+from .openai_client import generate_terraform_from_llm, generate_dockerfile_from_llm
 from .constants import AMI_DATA_SNIPPET
+from .templates import (
+    DOCKERFILE_FALLBACK_TEMPLATE,
+    COMPOSE_TEMPLATE,
+    MAKEFILE_TEMPLATE,
+    TERRAFORM_HINTS_TEMPLATE,
+    TERRAFORM_FALLBACK_TEMPLATE,
+)
 
 DEFAULT_AWS_INSTANCE = "t2.small"
 DRY_TERRAFORM_DEPLOYS = True if os.environ.get("DRY_TERRAFORM_DEPLOYS", "true") == "true" else False
@@ -138,66 +145,86 @@ def ensure_docker_assets(repo_dir: str, internal_port: int, log: logging.Logger)
     compose_path = os.path.join(repo_dir, "docker-compose.yml")
     makefile_path = os.path.join(repo_dir, "Makefile")
 
-    # Generic multi-language Dockerfile that tries common patterns
-    dockerfile = f"""
-# Generated Dockerfile
-FROM ubuntu:22.04
+    def read_file_safe(p: str, max_bytes: int = 20000) -> str:
+        try:
+            with open(p, "r", errors="ignore") as fh:
+                data = fh.read(max_bytes)
+            return data
+        except Exception:
+            return ""
 
-RUN apt-get update && apt-get install -y \
-    ca-certificates curl git python3 python3-pip nodejs npm \
-    && rm -rf /var/lib/apt/lists/*
+    def collect_relevant_files(root: str) -> List[dict]:
+        candidates = [
+            "requirements.txt", "pyproject.toml", "Pipfile", "Pipfile.lock",
+            "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+            "manage.py", "wsgi.py", "asgi.py",
+            "app.py", "main.py", "server.py", "run.py",
+            "Procfile", "Dockerfile", "README.md",
+        ]
+        selected: List[dict] = []
+        root_path = Path(root)
+        # Prefer exact candidate names anywhere in tree (depth-limited)
+        for path in root_path.rglob("*"):
+            if len(selected) >= 30:
+                break
+            if path.is_file() and path.name in candidates:
+                rel = str(path.relative_to(root_path))
+                selected.append({"path": rel, "content": read_file_safe(str(path))})
+        # If no obvious python entry found, include a few .py files that hint HTTP
+        hints = ["flask", "fastapi", "django", "uvicorn", "app.run(", "listen("]
+        if not any(x["path"].endswith(("app.py", "main.py")) for x in selected):
+            for path in root_path.rglob("*.py"):
+                if len(selected) >= 40:
+                    break
+                try:
+                    txt = read_file_safe(str(path))
+                    low = txt.lower()
+                    if any(h in low for h in hints):
+                        rel = str(path.relative_to(root_path))
+                        selected.append({"path": rel, "content": txt})
+                except Exception:
+                    continue
+        return selected
 
-WORKDIR /app
-COPY . /app
+    # Attempt LLM-designed Dockerfile
+    try:
+        tree = list_tree(repo_dir, max_depth=4)[:500]
+        files = collect_relevant_files(repo_dir)
+        llm_ctx = {
+            "objective": "Design a correct Dockerfile for the repository to run its HTTP service.",
+            "internal_port": internal_port,
+            "repo_tree": tree,
+            "files": files,
+        }
+        log.info("Requesting Dockerfile generation from OpenAI model...")
+        df_resp = generate_dockerfile_from_llm(llm_ctx)
+        dockerfile_llm = extract_code_block(df_resp)
+        def acceptable(df: str) -> bool:
+            s = df.lower()
+            return (
+                "from " in s and
+                (f"expose {internal_port}" in s or "expose ${port}" in s or "expose ${env:port}" in s) and
+                ("cmd" in s or "entrypoint" in s) and
+                ("```" not in df) and
+                (not df.strip().startswith("```") and not df.strip().endswith("```"))
+            )
+        if dockerfile_llm and acceptable(dockerfile_llm):
+            with open(dockerfile_path, "w") as f:
+                f.write(dockerfile_llm.strip() + "\n")
+            log.info("Wrote Dockerfile from OpenAI suggestion")
+        else:
+            raise RuntimeError("LLM Dockerfile rejected by policy")
+    except Exception as e:
+        log.warning("LLM Dockerfile generation failed (%s). Falling back to generic heuristics.", e)
+        # Generic multi-language Dockerfile that tries common patterns (improved Python detection, nested dirs)
+        dockerfile = DOCKERFILE_FALLBACK_TEMPLATE.format(internal_port=internal_port)
+        with open(dockerfile_path, "w") as f:
+            f.write(dockerfile)
 
-# Heuristics: install for Python/Node if present
-RUN if [ -f requirements.txt ]; then pip3 install --no-cache-dir -r requirements.txt; fi
-RUN if [ -f package.json ]; then npm ci || npm install; fi
+    # Compose/Makefile remain deterministic
+    compose = COMPOSE_TEMPLATE.format(internal_port=internal_port)
+    makefile = MAKEFILE_TEMPLATE
 
-# Build step for Node if applicable (try, ignore failure)
-RUN if [ -f package.json ]; then npm run build || true; fi
-
-EXPOSE {internal_port}
-
-# Start commands heuristics
-CMD bash -lc ' \
-  if [ -f manage.py ]; then python3 manage.py migrate || true; fi; \
-  if [ -f app.py ] || [ -f main.py ]; then python3 -m gunicorn -k uvicorn.workers.UvicornWorker app:app --bind 0.0.0.0:{internal_port} || python3 -m uvicorn app:app --host 0.0.0.0 --port {internal_port}; \
-  elif [ -f package.json ]; then npm start -- --port {internal_port}; \
-  else python3 -m http.server {internal_port}; fi'
-""".lstrip()
-
-    compose = f"""
-version: '3.9'
-services:
-  app:
-    build: .
-    container_name: app
-    restart: unless-stopped
-    ports:
-      - "8080:{internal_port}"
-    environment:
-      - PORT={internal_port}
-    # Optionally override command via environment or current repo conventions
-""".lstrip()
-
-    makefile = """
-.PHONY: up down logs
-
-up:
-	docker compose up -d --build
-	docker compose ps
-
-logs:
-	docker compose logs -f --tail=100
-
-down:
-	docker compose down -v
-""".lstrip()
-
-    # If repo already has docker assets, we will rewrite to fit our requirements
-    with open(dockerfile_path, "w") as f:
-        f.write(dockerfile)
     with open(compose_path, "w") as f:
         f.write(compose)
     with open(makefile_path, "w") as f:
@@ -211,205 +238,35 @@ def archive_repo(src_dir: str, dest_tar: str):
         tar.add(src_dir, arcname="app")
 
 
-TERRAFORM_HINTS = f"""
-- Region: ca-central-1
-- Instance type: {DEFAULT_AWS_INSTANCE}
-- OS: Ubuntu 24.04 (Noble) official Canonical AMI
-- Open ports: 22 (SSH), 8080 (HTTP)
-- Use terraform to:
-  - Create an SSH key via tls_private_key ONLY; do not use aws_key_pair.
-  - Inject the public key into ubuntu's authorized_keys using cloud-init user_data.
-  - Provision security group allowing 22 and 8080 from 0.0.0.0/0 (ingress only). Do not manage egress.
-  - Launch EC2 with the above SG
-  - Copy the prepared project tar.gz to /opt/app.tar.gz using file provisioner
-  - remote-exec: install Docker (latest) and docker compose plugin; extract to /opt/app; run 'make up'
-  - Ensure the connection uses user 'ubuntu' and the generated private key
-  - Output public_ip
-- Provider must rely on AWS_* env vars at runtime (do not hardcode keys).\n
-"""
+TERRAFORM_HINTS = TERRAFORM_HINTS_TEMPLATE.format(instance_type=DEFAULT_AWS_INSTANCE)
 
 
 def terraform_fallback_main_tf(name_suffix: str) -> str:
     # Fallback Terraform minimizing IAM requirements: no aws_key_pair, no SG egress management
-  return f"""
-terraform {{
-  required_providers {{
-    aws = {{
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }}
-    tls = {{
-      source  = "hashicorp/tls"
-      version = "~> 4.0"
-    }}
-    local = {{
-      source  = "hashicorp/local"
-      version = "~> 2.0"
-    }}
-  }}
-}}
-
-
-provider "aws" {{
-  region = var.region
-}}
-
-
-variable "region" {{ default = "ca-central-1" }}
-variable "az_suffix" {{ default = "a" }}
-
-
-resource "tls_private_key" "ssh" {{
-  algorithm = "RSA"
-  rsa_bits  = 4096
-}}
-
-
-resource "local_file" "private_key_pem" {{
-  content              = tls_private_key.ssh.private_key_pem
-  filename             = "id_rsa"
-  file_permission      = "0600"
-  directory_permission = "0700"
-}}
-
-
-{AMI_DATA_SNIPPET}
-
-
-# Networking: VPC with public subnet and Internet access
-resource "aws_vpc" "main" {{
-  cidr_block           = "10.0.0.0/16"
-  enable_dns_support   = true
-  enable_dns_hostnames = true
-  tags = {{ Name = "autodeployer-vpc" }}
-}}
-
-resource "aws_internet_gateway" "igw" {{
-  vpc_id = aws_vpc.main.id
-  tags = {{ Name = "autodeployer-igw" }}
-}}
-
-resource "aws_subnet" "public" {{
-  vpc_id                  = aws_vpc.main.id
-  cidr_block              = "10.0.1.0/24"
-  availability_zone       = "${{var.region}}${{var.az_suffix}}"
-  map_public_ip_on_launch = true
-  tags = {{ Name = "autodeployer-public" }}
-}}
-
-resource "aws_route_table" "public" {{
-  vpc_id = aws_vpc.main.id
-  # Note: the local route to 10.0.0.0/16 is implicit in AWS and cannot be explicitly created via Terraform.
-  route {{
-    cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.igw.id
-  }}
-  tags = {{ Name = "autodeployer-rt" }}
-}}
-
-resource "aws_route_table_association" "public" {{
-  subnet_id      = aws_subnet.public.id
-  route_table_id = aws_route_table.public.id
-}}
-
-resource "aws_security_group" "app" {{
-  name_prefix = "autodeployer-sg-"
-  description = "Allow SSH and 8080"
-  vpc_id      = aws_vpc.main.id
-
-  ingress {{
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }}
-  ingress {{
-    from_port   = 8080
-    to_port     = 8080
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }}
-  egress {{
-    from_port        = 0
-    to_port          = 0
-    protocol         = "-1"
-    cidr_blocks      = ["0.0.0.0/0"]
-    ipv6_cidr_blocks = ["::/0"]
-  }}
-}}
-
-
-resource "aws_instance" "app" {{
-  ami                    = data.aws_ami.ubuntu.id
-  instance_type          = "{DEFAULT_AWS_INSTANCE}"
-  subnet_id               = aws_subnet.public.id
-  vpc_security_group_ids  = [aws_security_group.app.id]
-  associate_public_ip_address = true
-  user_data = <<-EOT
-              #cloud-config
-              users:
-                - name: ubuntu
-                  groups:
-                    - sudo
-                  sudo: "ALL=(ALL) NOPASSWD:ALL"
-                  shell: /bin/bash
-                  ssh_authorized_keys:
-                    - ${{tls_private_key.ssh.public_key_openssh}}
-              EOT
-  tags = {{ Name = "autodeployer-{name_suffix}" }}
-}}
-
-
-resource "null_resource" "provision" {{
-  depends_on = [aws_instance.app]
-
-
-  connection {{
-    type        = "ssh"
-    host        = aws_instance.app.public_ip
-    user        = "ubuntu"
-    private_key = tls_private_key.ssh.private_key_pem
-  }}
-
-
-  provisioner "file" {{
-    source      = "app.tar.gz"
-    destination = "/home/ubuntu/app.tar.gz"
-  }}
-
-
-  provisioner "remote-exec" {{
-    inline = [
-      "sudo -n sed -i 's|http://[^ ]*ec2.archive.ubuntu.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list || true",
-      "true",
-      "sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -y",
-      "sudo -n apt-get install -y ca-certificates curl make gnupg lsb-release",
-      "sudo -n install -m 0755 -d /etc/apt/keyrings",
-      "curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo -n gpg --dearmor -o /etc/apt/keyrings/docker.gpg",
-      "echo \\"deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable\\" | sudo -n tee /etc/apt/sources.list.d/docker.list > /dev/null",
-      "sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -y",
-      "sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin",
-      "sudo -n usermod -aG docker ubuntu || true",
-      "sudo -n mkdir -p /opt/app",
-      "sudo -n tar -xzf /home/ubuntu/app.tar.gz -C /opt/",
-      "cd /opt/app && sudo -n make up",
-    ]
-  }}
-}}
-
-
-output "public_ip" {{
-  value = aws_instance.app.public_ip
-}}
-""".lstrip()
+  return TERRAFORM_FALLBACK_TEMPLATE.format(
+    instance_type=DEFAULT_AWS_INSTANCE,
+    name_suffix=name_suffix,
+    ami_data_snippet=AMI_DATA_SNIPPET,
+  )
 
 
 def extract_code_block(text: str) -> str:
-    # Extract first fenced code block
-    m = re.search(r"```(?:hcl|terraform|tf)?\n([\s\S]*?)\n```", text)
+    # Extract the first fenced code block of any language. Fallback: strip fences if present.
+    m = re.search(r"```[^\n]*\n([\s\S]*?)\n```", text)
     if m:
         return m.group(1)
-    return text
+    stripped = text.strip()
+    lines = stripped.splitlines()
+    if len(lines) >= 2 and lines[0].startswith("```") and lines[-1].startswith("```"):
+        return "\n".join(lines[1:-1])
+    # Also strip surrounding triple quotes if they wrap a fenced block
+    if len(lines) >= 4 and lines[0].startswith('"""') and lines[-1].startswith('"""'):
+        inner = "\n".join(lines[1:-1]).strip()
+        m2 = re.search(r"```[^\n]*\n([\s\S]*?)\n```", inner)
+        if m2:
+            return m2.group(1)
+        return inner
+    return stripped
 
 def is_llm_tf_acceptable(code: str) -> bool:
     code_l = code.lower()
