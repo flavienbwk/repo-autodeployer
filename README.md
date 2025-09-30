@@ -37,6 +37,8 @@ Also find:
         -d '{"description":"Deploy this flask application","repo_url":"https://github.com/Arvo-AI/hello_world"}'
     ```
 
+    Your app will be deployed on the public IP of the VM on port 8080
+
 ## Other route examples
 
 - List jobs for the current session
