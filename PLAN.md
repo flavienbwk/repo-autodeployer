@@ -27,7 +27,7 @@ What the API must also implement:
 
 - A .env.example file with all desired env variables
 - The API must implement a queuing system with a configurable amount of jobs (provided through env variable)
-- It must implement a POST /request (processes the query as per the requirements), GET /list (returns the list of requested jobs and their status) and the GET /job/<id> (returns the jobs infos including job ID; status and any log created) routes
+- It must implement a POST /request (processes the query as per the requirements), GET /list (returns the list of requested jobs and their status) and the GET /job/\<id> (returns the jobs infos including job ID; status and any log created) routes
 - No authentication is required to request the API
 
 The API must be Dockerized and have a Compose configuration. It should also have a Makefile and be runnable with `make up`.
@@ -36,11 +36,15 @@ Add a markdownlint GitHub Actions CI with default rules as a YAML file.
 
 ## 2. Scaling the system
 
-Use a control-plane/workers approach. Put all job logs to a PostgreSQL database. Update the API to reflect the possibility to also retrieve job logs from /job/<id>
+Use an external control-plane/workers approach with a RabbitMQ or Celery system. Put all job logs to a PostgreSQL database to not lose job details. Update the API to reflect the possibility to also retrieve job logs from /job/\<id>.
 
-## 3. Add recursive in-code analysis
+## 3. Add recursive and versatile in-code analysis
 
-- Analyze the code repository to identify changes that need to be made. Here are some hints of what to look at: application type (e.g., Flask, Node.js, django…), dependencies and configurations (e.g., requirements.txt, package.json…), any necessary changes, such as updating environment variables or network settings.
+Analyze the code repository to identify changes that need to be made. Here are some hints of what to look at: application type (e.g., Flask, Node.js, django…), dependencies and configurations (e.g., requirements.txt, package.json…), any necessary changes, such as updating environment variables or network settings.
+
+For instance, some apps may require to set env variables as per their documentation or codebase. Make sure to analyse the code to determine how to setup the project into a container. You may need to use docker-in-docker if the project is already dockerized.
+
+The script must call the LLM endpoint as many time as possible with the chosen files content to determine actions to do.
 
 ## 4. Determination of best deployment option
 
@@ -55,3 +59,7 @@ After deployment, test if API is working with healthchecks...
 ## 6. Private repo support
 
 ...
+
+## 7. Improve security
+
+Isolate AWS resources in dedicated VPCs and security groups...
