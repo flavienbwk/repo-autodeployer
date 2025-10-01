@@ -58,7 +58,7 @@ Also find:
 - Versatile containerized deployments ;
 - Auto-generated TF and Docker configuration ;
 - Secure connectivity to EC2 intances through individual SSH keys ;
-- Proper logging system ;
+- Robust logging system ;
 - Versatile (Docker) packaging ;
 - Secure resources consumption and limits ;
 - LLM failovers if LLM generates invalid TF files ;

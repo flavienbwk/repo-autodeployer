@@ -21,6 +21,8 @@ RUN bash -lc 'set -e; \
       if [ -f "$d/requirements.txt" ]; then pip3 install --no-cache-dir -r "$d/requirements.txt"; break; fi; \
     done; \
   fi'
+# Ensure common Python app servers are available for overrides
+RUN python3 -m pip install --no-cache-dir gunicorn uvicorn || true
 RUN if [ -f package.json ]; then npm ci || npm install; fi
 
 # Build step for Node if applicable (try, ignore failure)
@@ -45,7 +47,12 @@ CMD bash -lc 'set -e; \
   done; \
   if [ -n "$START_DIR" ]; then \
     cd "$START_DIR"; \
-    python3 -m gunicorn -k uvicorn.workers.UvicornWorker app:app --bind 0.0.0.0:{internal_port} \
+    # Prefer Gunicorn WSGI for Flask-like apps and ensure 0.0.0.0 binding
+    gunicorn app:app -b 0.0.0.0:{internal_port} \
+    || gunicorn main:app -b 0.0.0.0:{internal_port} \
+    || python3 -m flask --app app run --host 0.0.0.0 --port {internal_port} \
+    || python3 -m flask --app main run --host 0.0.0.0 --port {internal_port} \
+    || python3 -m gunicorn -k uvicorn.workers.UvicornWorker app:app --bind 0.0.0.0:{internal_port} \
     || python3 -m gunicorn -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:{internal_port} \
     || python3 -m uvicorn app:app --host 0.0.0.0 --port {internal_port} \
     || python3 -m uvicorn main:app --host 0.0.0.0 --port {internal_port} \
@@ -76,6 +83,10 @@ MAKEFILE_TEMPLATE = """
 .PHONY: up down logs
 
 up:
+	@if [ -f setup.sh ]; then \
+		echo "Running setup.sh"; \
+		bash ./setup.sh; \
+	fi
 	docker compose up -d --build
 	docker compose ps
 
@@ -94,13 +105,30 @@ TERRAFORM_HINTS_TEMPLATE = """
 - Use terraform to:
   - Create an SSH key via tls_private_key ONLY; do not use aws_key_pair.
   - Inject the public key into ubuntu's authorized_keys using cloud-init user_data.
-  - Provision security group allowing 22 and 8080 from 0.0.0.0/0 (ingress only). Do not manage egress.
+  - Provision security group allowing 22 and 8080 from 0.0.0.0/0 (ingress only). Explicitely allow all egress (ipv4 0.0.0.0/0 and ipv6 ::/0).
   - Launch EC2 with the above SG
   - Copy the prepared project tar.gz to /opt/app.tar.gz using file provisioner
   - remote-exec: install Docker (latest) and docker compose plugin; extract to /opt/app; run 'make up'
   - Ensure the connection uses user 'ubuntu' and the generated private key
   - Output public_ip
 - Provider must rely on AWS_* env vars at runtime (do not hardcode keys).
+""".lstrip()
+
+REMOTE_EXEC_SNIPPET = """
+provisioner "remote-exec" {
+  inline = [
+    "sudo -n sed -i 's|http://[^ ]*ec2.archive.ubuntu.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list || true",
+    "sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -y",
+    "sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y make curl",
+    "sudo -n env DEBIAN_FRONTEND=noninteractive curl -fsSL https://get.docker.com | sudo sh",
+    "sudo -n groupadd -f docker",
+    "sudo -n usermod -aG docker ubuntu",
+    "sudo -n systemctl enable --now docker || sudo -n service docker start || true",
+    "sudo -n mkdir -p /opt/app",
+    "sudo -n tar -xzf /home/ubuntu/app.tar.gz -C /opt/",
+    "cd /opt/app && sudo -n -E make up",
+  ]
+}
 """.lstrip()
 
 TERRAFORM_FALLBACK_TEMPLATE = """
@@ -239,20 +267,7 @@ resource "null_resource" "provision" {{
     destination = "/home/ubuntu/app.tar.gz"
   }}
 
-  provisioner "remote-exec" {{
-    inline = [
-      "sudo -n sed -i 's|http://[^ ]*ec2.archive.ubuntu.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list || true",
-      "sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -y",
-      "sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y make curl",
-      "sudo -n env DEBIAN_FRONTEND=noninteractive curl -fsSL https://get.docker.com | sudo sh",
-      "sudo -n groupadd -f docker",
-      "sudo -n usermod -aG docker ubuntu",
-      "sudo -n systemctl enable --now docker || sudo -n service docker start || true",
-      "sudo -n mkdir -p /opt/app",
-      "sudo -n tar -xzf /home/ubuntu/app.tar.gz -C /opt/",
-      "cd /opt/app && sudo -n -E make up",
-    ]
-  }}
+  {remote_exec_snippet}
 }}
 
 output "public_ip" {{
@@ -263,7 +278,7 @@ output "public_ip" {{
 LLM_TERRAFORM_SYSTEM_PROMPT_TEMPLATE = (
     "You are a Terraform expert. Generate minimal, working Terraform (main.tf) with restricted IAM assumptions: "
     "- Provision t2.small in ca-central-1 on Ubuntu 24.04 (Canonical AMI). Ensure the chosen Availability Zone supports this instance type (e.g., prefer ca-central-1a/b); if creating a subnet, set availability_zone accordingly. "
-    "- Open ports 22 and 8080 (ingress) and allow all outbound egress (0.0.0.0/0 and ::/0). "
+    "- Open ports 22 and 8080 (ingress) and allow all outbound egress (ipv4 0.0.0.0/0 and ipv6 ::/0). "
     "- Create an SSH key via tls_private_key ONLY; do NOT use aws_key_pair. "
     "- In cloud-init user_data, add the public key to the ubuntu user's authorized keys using exact Terraform interpolation ${{tls_private_key.ssh.public_key_openssh}} (single pair of braces), and ensure passwordless sudo: set groups: [sudo] and sudo: \"ALL=(ALL) NOPASSWD:ALL\" for the ubuntu user. "
     "- For networking, ensure outbound internet: attach the instance to a public subnet with an Internet Gateway and route 0.0.0.0/0 to the IGW. The local route for the VPC CIDR (e.g., 10.0.0.0/16) is implicit in AWS route tables; do not try to create it. If a default VPC/subnet isn’t available, create a minimal VPC + public subnet + IGW + route table + association, and enable DNS support/hostnames on the VPC. "
@@ -273,21 +288,47 @@ LLM_TERRAFORM_SYSTEM_PROMPT_TEMPLATE = (
     "- To avoid mirror/network issues: prefer forcing IPv4 by passing -o Acquire::ForceIPv4=true to apt-get update/installs (instead of writing apt.conf), replace any ec2.archive.ubuntu.com mirrors with archive.ubuntu.com in sources, and add apt retries/timeouts. "
     "- Install Docker + compose, extract to /opt/app, run 'make up'. Prefix all privileged commands with sudo -n and use DEBIAN_FRONTEND=noninteractive with apt-get to avoid prompts. "
     "- Use AWS credentials from env; do not hardcode. "
-    "- Avoid any data sources or resources that require ec2:DescribeKeyPairs or RevokeSecurityGroupEgress. "
+    "- Avoid any data sources or resources that require ec2:DescribeKeyPairs. "
     "- Use this AMI data block verbatim to look up Canonical Ubuntu 24.04 in any region: \n\n"
     "```hcl\n{ami_data_snippet}\n```\n\n"
-    "Reference it as: ami = data.aws_ami.ubuntu.id. Output only a single main.tf in one fenced code block. "
-    "When writing inline remote-exec command lists in HCL, ensure any inner double quotes are escaped as \\\" (e.g., echo \\\"...\\\")."
+    "Reference it as: ami = data.aws_ami.ubuntu.id.\n"
+    "- Use this remote-exec provisioner block verbatim under your provisioning resource (with a valid SSH connection and a preceding file provisioner that uploads /home/ubuntu/app.tar.gz):\n\n"
+    "```hcl\n{remote_exec_snippet}\n```\n"
+    "- Output only a single main.tf in one fenced code block. "
+    "- When writing inline remote-exec command lists in HCL, ensure any inner double quotes are escaped as \\\" (e.g., echo \\\"...\\\")."
 )
 
 LLM_DOCKERFILE_SYSTEM_PROMPT = (
     "You are a senior DevOps engineer. Produce a working Dockerfile tailored to the provided project files. "
     "Requirements: "
-    "- Choose an appropriate official base image (e.g., python:*-slim for Python, node:* for Node). "
+    "- Choose an appropriate official base image (e.g., python:*\-slim for Python, node:* for Node). "
     "- Install dependencies from the correct directory (requirements.txt, pyproject.toml, package.json, etc.), accounting for nested app directories (e.g., app/, src/, server/, backend/). "
     "- Set WORKDIR, COPY only what is needed first for better layer caching if obvious. "
     "- Expose the provided port (ENV PORT may be set, but EXPOSE must match). "
-    "- Start the actual HTTP server for the app (prefer gunicorn/uvicorn for FastAPI/ASGI, flask run or gunicorn for Flask, django runserver for Django, npm start for Node, etc.). "
+    "- Regardless of what the source code does, ensure the server binds to 0.0.0.0 so it is reachable from outside the container. If the code uses app.run(host=\"127.0.0.1\", ...), override by invoking a production server (gunicorn for Flask/Wsgi, uvicorn for ASGI) binding to 0.0.0.0. "
+    "- Start the actual HTTP server for the app (prefer gunicorn for Flask/Wsgi, uvicorn for ASGI, flask run for simple cases; django runserver for Django; npm start for Node, etc.). "
     "- Do not emit docker-compose.yml content; Dockerfile only. "
-    "Output format rules (mandatory): Respond with ONLY the Dockerfile content, no Markdown code fences, no surrounding quotes, and no explanations."
+    "- Output format rules (mandatory): Respond with ONLY the Dockerfile content, no Markdown code fences, no surrounding quotes, and no explanations."
+)
+
+LLM_COMPOSE_SYSTEM_PROMPT = (
+    "You are a senior DevOps engineer. Generate a valid autodeploy.compose.yml for running the given repository. "
+    "Follow these rules: "
+    "- If the repo does NOT already include a Dockerfile or any compose file, generate a single-service compose that builds the app from the repo root, maps host 8080 to the app's internal port, and sets PORT env accordingly. Prefer overriding the default run command to ensure the service binds to 0.0.0.0 even if the source code tries to bind 127.0.0.1. For Python/Flask, prefer `gunicorn module:app -b 0.0.0.0:<port>`. "
+    "- If the repo already uses Docker (Dockerfile) and/or compose (docker-compose.yml/compose.yaml), do NOT modify them. Instead, generate a wrapper (in autodeploy.compose.yml) compose that runs docker-in-docker (image: docker:27-dind or docker:stable-dind) with privileged: true, mounts the repo, exposes host port 8080 mapping to the inner app, and executes a setup script (./setup.sh) before invoking the inner project's compose or docker run commands. If analysis shows the app binds to 127.0.0.1, the wrapper must ignore the inner compose and instead build and run the app image directly with a command that binds 0.0.0.0 (e.g., gunicorn for Flask) and publish 8080:PORT. "
+    "- Ensure the wrapper compose waits for dockerd to be ready before running inner commands. "
+    "- Do NOT use ${PORT} or other ${VAR} expansions in YAML values (Compose substitutes from host). Use $$PORT to defer to the container shell, or hardcode the numeric port provided in context. "
+    "- The output MUST be only the YAML content of autodeploy.compose.yml, no code fences, no comments at top, no explanations. "
+)
+
+LLM_SETUP_SCRIPT_SYSTEM_PROMPT = (
+    "You are a senior DevOps engineer. Generate an idempotent bash setup script (setup.sh) to prepare running the repository's service inside docker-in-docker. "
+    "Use signals from the file tree and README to infer necessary steps: creating .env files with sane defaults, running migrations, building assets, generating keys, etc. "
+    "Rules: "
+    "- Shebang: #!/usr/bin/env bash and set -euo pipefail. "
+    "- The script MUST be idempotent and safe to run multiple times. "
+    "- Create missing .env files and populate required variables with best-effort defaults documented in README/package files. "
+    "- If the project uses docker compose already, leave its files intact and do not edit them; only prepare inputs. "
+    "- Print progress with echo. "
+    "- Output MUST be only the script content, no code fences, no explanations. "
 )

@@ -1,6 +1,6 @@
 # Plan prompts
 
-## 1. Base project with docker-in-docker
+## 1. ✅ Base project with docker-in-docker
 
 You are a senior software engineer and architect. We're building a backend system that automates the process of deploying applications based on a natural language comment and a GitHub repository URL as input.
 
@@ -34,11 +34,7 @@ The API must be Dockerized and have a Compose configuration. It should also have
 
 Add a markdownlint GitHub Actions CI with default rules as a YAML file.
 
-## 2. Scaling the system
-
-Use an external control-plane/workers approach with a RabbitMQ or Celery system. Put all job logs to a PostgreSQL database to not lose job details. Update the API to reflect the possibility to also retrieve job logs from /job/\<id>.
-
-## 3. Add recursive and versatile in-code analysis
+## 2. 🔄 Add recursive and versatile in-code analysis
 
 Analyze the code repository to identify changes that need to be made. Here are some hints of what to look at: application type (e.g., Flask, Node.js, django…), dependencies and configurations (e.g., requirements.txt, package.json…), any necessary changes, such as updating environment variables or network settings.
 
@@ -46,20 +42,28 @@ For instance, some apps may require to set env variables as per their documentat
 
 The script must call the LLM endpoint as many time as possible with the chosen files content to determine actions to do.
 
-## 4. Determination of best deployment option
+## 3. ⬜ Scaling the system
+
+Use an external control-plane/workers approach with a RabbitMQ or Celery system. Put all job logs to a PostgreSQL database to not lose job details. Update the API to reflect the possibility to also retrieve job logs from /job/\<id>.
+
+## 4. ⬜ Determination of best deployment option
 
 Instead of using a VM, automatically determine the type and configuration of deployment that would work best for the application. Should it be deployed on serverless infrastructure? Should it be deployed using kubernetes? A virtual machine.?
 
 Update the part of the code that generates the final Terraform code
 
-## 5. Healthchecks
+## 5. ⬜ Improve security
+
+Isolate AWS resources in dedicated VPCs and security groups...
+
+## 6. ⬜ Healthchecks
 
 After deployment, test if API is working with healthchecks...
 
-## 6. Private repo support
+## 7. ⬜ Private repo support
 
 Through PAT fine grained...
 
-## 7. Improve security
+## 8. ⬜ Support multiple cloud providers
 
-Isolate AWS resources in dedicated VPCs and security groups...
+Introduce a new POST /request parameter "host_provider" to support multiple host providers...
