@@ -34,13 +34,15 @@ The API must be Dockerized and have a Compose configuration. It should also have
 
 Add a markdownlint GitHub Actions CI with default rules as a YAML file.
 
-## 2. 🔄 Add recursive and versatile in-code analysis
+## 2. 🔄 Add agentic in-code analysis
 
 Analyze the code repository to identify changes that need to be made. Here are some hints of what to look at: application type (e.g., Flask, Node.js, django…), dependencies and configurations (e.g., requirements.txt, package.json…), any necessary changes, such as updating environment variables or network settings.
 
 For instance, some apps may require to set env variables as per their documentation or codebase. Make sure to analyse the code to determine how to setup the project into a container. You may need to use docker-in-docker if the project is already dockerized.
 
 The script must call the LLM endpoint as many time as possible with the chosen files content to determine actions to do.
+
+"If the repo already uses Docker (Dockerfile) and/or compose (docker-compose.yml/compose.yaml), do NOT modify them. Instead, generate a wrapper compose configuration (docker-compose.yml file at top level) that runs docker-in-docker (image: docker:27-dind or docker:stable-dind) with privileged: true, mounts the repo, exposes host port 8080 mapping to the inner app, and executes a setup script (./setup.sh) before invoking the inner project's compose or docker run commands. If analysis shows the app binds to 127.0.0.1, the wrapper must ignore the inner compose and instead build and run the app image directly with a command that binds 0.0.0.0 (e.g., gunicorn for Flask) and publish 8080:PORT."
 
 ## 3. ⬜ Scaling the system
 
@@ -55,6 +57,8 @@ Update the part of the code that generates the final Terraform code
 ## 5. ⬜ Improve security
 
 Isolate AWS resources in dedicated VPCs and security groups...
+
+Add a token-based authentication to call the API routes...
 
 ## 6. ⬜ Healthchecks
 

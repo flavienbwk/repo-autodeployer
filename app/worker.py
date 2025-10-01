@@ -12,10 +12,12 @@ from .openai_client import generate_terraform_from_llm, generate_dockerfile_from
 from .constants import (
     DEFAULT_AWS_INSTANCE,
     DRY_TERRAFORM_DEPLOYS,
-    AMI_DATA_SNIPPET
+    AMI_DATA_SNIPPET,
+    DIND_WRAPPER_DEFAULT_FAILOVER,
+    DIND_WRAPPER_LOCALHOST_FAILOVER
 )
 from .templates import (
-    DOCKERFILE_FALLBACK_TEMPLATE,
+    REMOTE_EXEC_SNIPPET,
     COMPOSE_TEMPLATE,
     MAKEFILE_TEMPLATE,
     TERRAFORM_HINTS_TEMPLATE,
@@ -144,11 +146,15 @@ def infer_app_port(repo_dir: str, log: logging.Logger) -> int:
 def ensure_docker_assets(repo_dir: str, internal_port: int, log: logging.Logger):
     """
     Ensure dockerization per requirements
+
+    Writes Dockerfile, docker-compose.yml, Makefile, and setup.sh one directory ABOVE the cloned repo.
+    For example, if repo is at /workdir/repo, assets are written to /workdir.
     """
-    dockerfile_path = os.path.join(repo_dir, "Dockerfile")
-    compose_path = os.path.join(repo_dir, "docker-compose.yml")
-    makefile_path = os.path.join(repo_dir, "Makefile")
-    setup_path = os.path.join(repo_dir, "setup.sh")
+    out_dir = os.path.dirname(os.path.abspath(repo_dir))
+    dockerfile_path = os.path.join(out_dir, "Dockerfile")
+    compose_path = os.path.join(out_dir, "docker-compose.yml")
+    makefile_path = os.path.join(out_dir, "Makefile")
+    setup_path = os.path.join(out_dir, "setup.sh")
 
     def read_file_safe(p: str, max_bytes: int = 20000) -> str:
         try:
@@ -223,152 +229,103 @@ def ensure_docker_assets(repo_dir: str, internal_port: int, log: logging.Logger)
         if has_existing_docker:
             break
 
-    tree = list_tree(repo_dir, max_depth=4)[:500]
-    files = collect_relevant_files(repo_dir)
     binds_localhost = detect_localhost_binding(repo_dir)
 
-    # If the repo is not dockerized yet, synthesize Dockerfile via LLM with fallback
-    if not has_existing_docker:
-        try:
-            llm_ctx = {
-                "objective": "Design a correct Dockerfile for the repository to run its HTTP service.",
-                "internal_port": internal_port,
-                "repo_tree": tree,
-                "files": files,
-                "localhost_binding_detected": binds_localhost,
-                "require_bind_host": "0.0.0.0",
-            }
-            log.info("Requesting Dockerfile generation from OpenAI model...")
-            df_resp = generate_dockerfile_from_llm(llm_ctx)
-            dockerfile_llm = extract_code_block(df_resp)
-            def acceptable(df: str) -> bool:
-                s = df.lower()
-                conds = [
-                    "from " in s,
-                    (f"expose {internal_port}" in s or "expose ${port}" in s or "expose ${env:port}" in s),
-                    ("cmd" in s or "entrypoint" in s),
-                    ("```" not in df),
-                ]
-                if binds_localhost:
-                    conds.append("0.0.0.0" in s)
-                return all(conds)
-            if dockerfile_llm and acceptable(dockerfile_llm):
-                with open(dockerfile_path, "w") as f:
-                    f.write(dockerfile_llm.strip() + "\n")
-                log.info("Wrote Dockerfile from OpenAI suggestion")
-            else:
-                raise RuntimeError("LLM Dockerfile rejected by policy")
-        except Exception as e:
-            log.warning("LLM Dockerfile generation failed (%s). Falling back to generic heuristics.", e)
-            dockerfile = DOCKERFILE_FALLBACK_TEMPLATE.format(internal_port=internal_port)
-            with open(dockerfile_path, "w") as f:
-                f.write(dockerfile)
-    else:
-        log.info("Existing Docker/Compose detected in repository; will not overwrite Dockerfile.")
-        # Generate setup.sh via LLM to prepare env/config before running compose via DinD
-        try:
-            setup_ctx = {
-                "objective": "Generate an idempotent setup.sh to prepare the app (.env, migrations, keys) before running compose under DinD.",
-                "repo_tree": tree,
-                "files": files,
-                "localhost_binding_detected": binds_localhost,
-                "require_bind_host": "0.0.0.0",
-            }
-            log.info("Requesting setup.sh generation from OpenAI model...")
-            setup_resp = generate_setup_script_from_llm(setup_ctx)
-            setup_script = extract_code_block(setup_resp) or setup_resp
-            if setup_script.strip() == "":
-                raise RuntimeError("Empty setup.sh from LLM")
-            if "#!/" not in (setup_script.splitlines()[0] if setup_script.splitlines() else ""):
-                setup_script = "#!/usr/bin/env bash\nset -euo pipefail\n" + setup_script
-            with open(setup_path, "w") as f:
-                f.write(setup_script.strip() + "\n")
-            try:
-                os.chmod(setup_path, 0o755)
-            except Exception:
-                pass
-            log.info("Wrote setup.sh from OpenAI suggestion")
-        except Exception as e:
-            log.warning("Failed to generate setup.sh from LLM: %s. Writing minimal placeholder.", e)
-            with open(setup_path, "w") as f:
-                f.write("#!/usr/bin/env bash\nset -euo pipefail\necho 'No setup required.'\n")
-            try:
-                os.chmod(setup_path, 0o755)
-            except Exception:
-                pass
-
-    # Compose via LLM for both cases (outer wrapper if dockerized, otherwise simple app service)
+    # Synthesize Dockerfile via LLM with fallback
     try:
-        compose_ctx = {
-            "objective": "Generate docker-compose.yml for the repository. Use DinD wrapper if already dockerized; otherwise single service build.",
+        llm_ctx = {
+            "objective": "Design a correct Dockerfile for the repository to run its HTTP service.",
             "internal_port": internal_port,
-            "repo_tree": tree,
-            "files": files,
-            "dockerized": has_existing_docker,
+            "tree": list_tree(f"{repo_dir}/..", max_depth=4)[:500],
+            "files": collect_relevant_files(repo_dir),
             "localhost_binding_detected": binds_localhost,
             "require_bind_host": "0.0.0.0",
         }
-        log.info("Requesting docker-compose.yml generation from OpenAI model...")
-        comp_resp = generate_compose_from_llm(compose_ctx)
-        compose_yaml = extract_code_block(comp_resp) or comp_resp
-        if "services:" not in compose_yaml:
-            raise RuntimeError("LLM compose did not include services block")
-        # Avoid Compose-time variable interpolation issues: never keep ${PORT} in YAML
-        # Replace ${PORT} with $$PORT for runtime shell expansion, and fix port mappings
-        compose_yaml = compose_yaml.replace("${PORT}", "$$PORT").replace("${port}", "$$PORT")
-        compose_yaml = compose_yaml.replace("8080:${PORT}", f"8080:{internal_port}").replace("8080:${port}", f"8080:{internal_port}")
-        with open(compose_path, "w") as f:
-            f.write(compose_yaml.strip() + "\n")
-    except Exception as e:
-        # As a last resort, fallback to previous deterministic template for non-dockerized repos
-        if not has_existing_docker:
-            log.warning("LLM compose generation failed (%s). Falling back to minimal template.", e)
-            with open(compose_path, "w") as f:
-                f.write(COMPOSE_TEMPLATE.format(internal_port=internal_port))
-        else:
-            # If dockerized, synthesize a generic DinD wrapper compose
-            log.warning("LLM compose generation failed for dockerized repo (%s). Writing generic DinD wrapper.", e)
+        log.info("Requesting Dockerfile generation from OpenAI model...")
+        df_resp = generate_dockerfile_from_llm(llm_ctx)
+        dockerfile_llm = extract_code_block(df_resp)
+        def acceptable(df: str) -> bool:
+            s = df.lower()
+            conds = [
+                "from " in s,
+                (f"expose {internal_port}" in s or "expose ${port}" in s or "expose ${env:port}" in s),
+                ("cmd" in s or "entrypoint" in s),
+                ("```" not in df),
+            ]
             if binds_localhost:
-                dind_wrapper = f"""
-version: '3.9'
-services:
-  dind:
-    image: docker:27-dind
-    privileged: true
-    environment:
-      - DOCKER_TLS_CERTDIR=
-    ports:
-      - "8080:8080"
-    volumes:
-      - ./:/workspace
-    command: >-
-      sh -lc "dockerd-entrypoint.sh &\n      while ! docker info >/dev/null 2>&1; do sleep 1; done;\n      cd /workspace && ./setup.sh || true;\n      echo 'Bypassing inner compose to enforce external bind';\n      docker build -t app . && docker run -d -p 8080:{internal_port} --name inner-app app sh -lc 'gunicorn app:app -b 0.0.0.0:{internal_port} || gunicorn main:app -b 0.0.0.0:{internal_port} || python3 -m flask --app app run --host 0.0.0.0 --port {internal_port} || python3 -m flask --app main run --host 0.0.0.0 --port {internal_port}';\n      tail -f /dev/null"
-"""
-            else:
-                dind_wrapper = f"""
-version: '3.9'
-services:
-  dind:
-    image: docker:27-dind
-    privileged: true
-    environment:
-      - DOCKER_TLS_CERTDIR=
-    ports:
-      - "8080:8080"
-    volumes:
-      - ./:/workspace
-    command: >-
-      sh -lc "dockerd-entrypoint.sh &\n      while ! docker info >/dev/null 2>&1; do sleep 1; done;\n      cd /workspace && ./setup.sh || true;\n      if [ -f docker-compose.yml ] || [ -f compose.yaml ] || [ -f compose.yml ]; then\n        docker compose up -d --build;\n      else\n        echo 'No inner compose found; attempting to build Dockerfile and run';\n        docker build -t app . && docker run -d -p 8080:{internal_port} --name inner-app app;\n      fi;\n      tail -f /dev/null"
-"""
-            with open(compose_path, "w") as f:
-                f.write(dind_wrapper)
+                conds.append("0.0.0.0" in s)
+            return all(conds)
+        if dockerfile_llm and acceptable(dockerfile_llm):
+            with open(dockerfile_path, "w") as f:
+                f.write(dockerfile_llm.strip() + "\n")
+            log.info("Wrote Dockerfile from OpenAI suggestion")
+        else:
+            raise RuntimeError("LLM Dockerfile rejected by policy")
+    except Exception as e:
+        log.warning("LLM Dockerfile generation failed (%s). Can't proceed.", e)
+        raise e
+
+    # Generate setup.sh via LLM to prepare env/config before running compose via DinD
+    try:
+        # Include README content if present at the repo root
+        setup_ctx = {
+            "objective": "Generate an idempotent setup.sh to prepare the app (.env, migrations, keys) before running compose only if required.",
+            "tree": list_tree(f"{repo_dir}/..", max_depth=4)[:500],
+            "files": collect_relevant_files(repo_dir),
+            "localhost_binding_detected": binds_localhost,
+            "require_bind_host": "0.0.0.0",
+        }
+        log.info("Requesting setup.sh generation from OpenAI model...")
+        setup_resp = generate_setup_script_from_llm(setup_ctx)
+        setup_script = extract_code_block(setup_resp) or setup_resp
+        if setup_script.strip() == "":
+            raise RuntimeError("Empty setup.sh from LLM")
+        if "#!/" not in (setup_script.splitlines()[0] if setup_script.splitlines() else ""):
+            setup_script = "#!/usr/bin/env bash\nset -euo pipefail\n" + setup_script
+        with open(setup_path, "w") as f:
+            f.write(setup_script.strip() + "\n")
+        try:
+            os.chmod(setup_path, 0o755)
+        except Exception:
+            pass
+        log.info("Wrote setup.sh from OpenAI suggestion")
+    except Exception as e:
+        log.warning("Failed to generate setup.sh from LLM: %s. Writing minimal placeholder.", e)
+        with open(setup_path, "w") as f:
+            f.write("#!/usr/bin/env bash\nset -euo pipefail\necho 'No setup required.'\n")
+        try:
+            os.chmod(setup_path, 0o755)
+        except Exception:
+            pass
+
+    # Compose via LLM
+    compose_ctx = {
+        "objective": "Generate docker-compose.yml for the repository as per instructions provided.",
+        "internal_port": internal_port,
+        "tree": list_tree(f"{repo_dir}/..", max_depth=4)[:500],
+        "files": collect_relevant_files(repo_dir),
+        "top_level_dockerfile": dockerfile_llm,
+        "localhost_binding_detected": binds_localhost,
+        "require_bind_host": "0.0.0.0",
+    }
+    log.info("Requesting docker-compose.yml generation from OpenAI model...")
+    comp_resp = generate_compose_from_llm(compose_ctx)
+    compose_yaml = extract_code_block(comp_resp) or comp_resp
+    if "services:" not in compose_yaml:
+        raise RuntimeError("LLM compose did not include services block")
+    # Avoid Compose-time variable interpolation issues: never keep ${PORT} in YAML
+    # Replace ${PORT} with $$PORT for runtime shell expansion, and fix port mappings
+    compose_yaml = compose_yaml.replace("${PORT}", "$$PORT").replace("${port}", "$$PORT")
+    compose_yaml = compose_yaml.replace("8080:${PORT}", f"8080:{internal_port}").replace("8080:${port}", f"8080:{internal_port}")
+    with open(compose_path, "w") as f:
+        f.write(compose_yaml.strip() + "\n")
 
     # Write Makefile (updated to run setup.sh if present)
     with open(makefile_path, "w") as f:
         f.write(MAKEFILE_TEMPLATE)
 
     log.info(
-        "Containerization assets written/updated: %s%s autodeploy.compose.yml, Makefile",
+        "Containerization assets written/updated: %s%s docker-compose.yml, Makefile",
         "Dockerfile, " if not has_existing_docker else "",
         "setup.sh, " if has_existing_docker else "",
     )
@@ -380,7 +337,7 @@ def apply_repo_rewrites(repo_dir: str, log: logging.Logger) -> None:
     """
     try:
         # Define repo-wide, regex-based rewrites (easy to extend). Applied to ALL text files.
-        # For now: normalize any localhost:5000 reference to localhost:8080 so external port mapping works.
+        # For now: avoid fixed address/port code for them to default to /
         rewrite_patterns: List[tuple[re.Pattern[str], str]] = [
             (re.compile(r"http(s)?:\/\/localhost:[0-9]{1,5}\b"), ""),
         ]
@@ -439,6 +396,7 @@ def terraform_fallback_main_tf(name_suffix: str) -> str:
         instance_type=DEFAULT_AWS_INSTANCE,
         name_suffix=name_suffix,
         ami_data_snippet=AMI_DATA_SNIPPET,
+        remote_exec_snippet=REMOTE_EXEC_SNIPPET
     )
     # Ensure Docker service is started before attempting compose usage
     try:
@@ -513,7 +471,7 @@ def process_deploy_request(job_manager: JobManager, job_id: str, description: st
 
     # Prepare archive to transfer
     tar_path = os.path.join(workdir, "app.tar.gz")
-    archive_repo(repo_dir, tar_path)
+    archive_repo(workdir, tar_path)
     log.info("Prepared project archive: %s", tar_path)
 
     # Ask LLM to generate Terraform
@@ -562,16 +520,31 @@ def process_deploy_request(job_manager: JobManager, job_id: str, description: st
         except Exception:
             pass
 
-    # Normalize Terraform script to ensure archive layout matches extraction path
-    def _normalize_tf(code: str) -> str:
-        # Ensure we extract to /opt/ so the extracted folder /opt/app exists (archive root is 'app')
-        code = re.sub(r"tar\s+-xzf\s+/home/ubuntu/app\.tar\.gz\s+-C\s+/opt/app\b", "tar -xzf /home/ubuntu/app.tar.gz -C /opt/", code)
-        code = re.sub(r"tar\s+-xzf\s+/home/ubuntu/app\.tar\.gz\s+-C\s+/opt\b", "tar -xzf /home/ubuntu/app.tar.gz -C /opt/", code)
-        # If any scripts cd into /opt/app/app, fix to /opt/app
-        code = re.sub(r"cd\s+/opt/app/app\b", "cd /opt/app", code)
-        return code
+    # Ensure the generated SSH private key is persisted locally as id_rsa for later SSH access
+    def _ensure_local_private_key(tf_code: str) -> str:
+        try:
+            if "resource \"local_file\"" in tf_code and "private_key_pem" in tf_code:
+                return tf_code
+            # Insert a local_file resource that writes tls_private_key.ssh.private_key_pem to ./id_rsa
+            local_file_block = (
+                '\nresource "local_file" "private_key_pem" {\n'
+                '  content              = tls_private_key.ssh.private_key_pem\n'
+                '  filename             = "id_rsa"\n'
+                '  file_permission      = "0600"\n'
+                '  directory_permission = "0700"\n'
+                '}\n\n'
+            )
+            # Prefer inserting before the first output block if present to keep outputs last
+            import re as _re
+            m = _re.search(r"^\s*output\s+\"public_ip\"", tf_code, flags=_re.MULTILINE)
+            if m:
+                idx = m.start()
+                return tf_code[:idx] + local_file_block + tf_code[idx:]
+            return tf_code.rstrip() + "\n" + local_file_block
+        except Exception:
+            return tf_code
 
-    main_tf = _normalize_tf(main_tf)
+    main_tf = _ensure_local_private_key(main_tf)
 
     with open(os.path.join(terraform_dir, "main.tf"), "w") as f:
         f.write(main_tf)

@@ -1,75 +1,13 @@
 # Centralized large text templates with .format-style placeholders
 # Use double braces {{ }} to emit literal braces in HCL/YAML where needed
 
-DOCKERFILE_FALLBACK_TEMPLATE = """
-# Generated Dockerfile (fallback)
-FROM ubuntu:22.04
-
-RUN apt-get update && apt-get install -y \
-    ca-certificates curl git python3 python3-pip nodejs npm \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-COPY . /app
-
-# Heuristics: install deps for Python/Node if present (support nested common dirs)
-RUN bash -lc 'set -e; \
-  if [ -f requirements.txt ]; then \
-    pip3 install --no-cache-dir -r requirements.txt; \
-  else \
-    for d in app src server backend; do \
-      if [ -f "$d/requirements.txt" ]; then pip3 install --no-cache-dir -r "$d/requirements.txt"; break; fi; \
-    done; \
-  fi'
-# Ensure common Python app servers are available for overrides
-RUN python3 -m pip install --no-cache-dir gunicorn uvicorn || true
-RUN if [ -f package.json ]; then npm ci || npm install; fi
-
-# Build step for Node if applicable (try, ignore failure)
-RUN if [ -f package.json ]; then npm run build || true; fi
-
-EXPOSE {internal_port}
-
-# Start commands heuristics (prefer Python HTTP apps; support nested app directories)
-CMD bash -lc 'set -e; \
-  # Django migrations if a manage.py exists anywhere
-  DJANGO_DIR=""; \
-  for d in . app src server backend; do \
-    if [ -f "$d/manage.py" ]; then DJANGO_DIR="$d"; break; fi; \
-  done; \
-  if [ -n "$DJANGO_DIR" ]; then \
-    cd "$DJANGO_DIR"; python3 manage.py migrate || true; cd - >/dev/null; \
-  fi; \
-  # Locate Python entrypoint directory
-  START_DIR=""; \
-  for d in . app src server backend; do \
-    if [ -f "$d/app.py" ] || [ -f "$d/main.py" ]; then START_DIR="$d"; break; fi; \
-  done; \
-  if [ -n "$START_DIR" ]; then \
-    cd "$START_DIR"; \
-    # Prefer Gunicorn WSGI for Flask-like apps and ensure 0.0.0.0 binding
-    gunicorn app:app -b 0.0.0.0:{internal_port} \
-    || gunicorn main:app -b 0.0.0.0:{internal_port} \
-    || python3 -m flask --app app run --host 0.0.0.0 --port {internal_port} \
-    || python3 -m flask --app main run --host 0.0.0.0 --port {internal_port} \
-    || python3 -m gunicorn -k uvicorn.workers.UvicornWorker app:app --bind 0.0.0.0:{internal_port} \
-    || python3 -m gunicorn -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:{internal_port} \
-    || python3 -m uvicorn app:app --host 0.0.0.0 --port {internal_port} \
-    || python3 -m uvicorn main:app --host 0.0.0.0 --port {internal_port} \
-    || python3 app.py \
-    || python3 main.py; \
-  elif [ -f package.json ]; then \
-    npm start -- --port {internal_port}; \
-  else \
-    python3 -m http.server {internal_port}; \
-  fi'
-""".lstrip()
-
 COMPOSE_TEMPLATE = """
 version: '3.9'
 services:
   app:
-    build: .
+    build:
+      context: ./repo
+      dockerfile: ../Dockerfile
     container_name: app
     restart: unless-stopped
     ports:
@@ -124,7 +62,7 @@ provisioner "remote-exec" {
     "sudo -n groupadd -f docker",
     "sudo -n usermod -aG docker ubuntu",
     "sudo -n systemctl enable --now docker || sudo -n service docker start || true",
-    "sudo -n mkdir -p /opt/app",
+    "sudo -n mkdir -p /opt",
     "sudo -n tar -xzf /home/ubuntu/app.tar.gz -C /opt/",
     "cd /opt/app && sudo -n -E make up",
   ]
@@ -298,7 +236,7 @@ LLM_TERRAFORM_SYSTEM_PROMPT_TEMPLATE = (
     "- When writing inline remote-exec command lists in HCL, ensure any inner double quotes are escaped as \\\" (e.g., echo \\\"...\\\")."
 )
 
-LLM_DOCKERFILE_SYSTEM_PROMPT = (
+LLM_DOCKERFILE_SYSTEM_PROMPT = f"""
     "You are a senior DevOps engineer. Produce a working Dockerfile tailored to the provided project files. "
     "Requirements: "
     "- Choose an appropriate official base image (e.g., python:*\-slim for Python, node:* for Node). "
@@ -309,24 +247,29 @@ LLM_DOCKERFILE_SYSTEM_PROMPT = (
     "- Start the actual HTTP server for the app (prefer gunicorn for Flask/Wsgi, uvicorn for ASGI, flask run for simple cases; django runserver for Django; npm start for Node, etc.). "
     "- Do not emit docker-compose.yml content; Dockerfile only. "
     "- Output format rules (mandatory): Respond with ONLY the Dockerfile content, no Markdown code fences, no surrounding quotes, and no explanations."
-)
+"""
 
-LLM_COMPOSE_SYSTEM_PROMPT = (
-    "You are a senior DevOps engineer. Generate a valid autodeploy.compose.yml for running the given repository. "
+LLM_COMPOSE_SYSTEM_PROMPT = f"""
+    "You are a senior DevOps engineer. Generate a valid docker-compose.yml for running the given repository. "
     "Follow these rules: "
-    "- If the repo does NOT already include a Dockerfile or any compose file, generate a single-service compose that builds the app from the repo root, maps host 8080 to the app's internal port, and sets PORT env accordingly. Prefer overriding the default run command to ensure the service binds to 0.0.0.0 even if the source code tries to bind 127.0.0.1. For Python/Flask, prefer `gunicorn module:app -b 0.0.0.0:<port>`. "
-    "- If the repo already uses Docker (Dockerfile) and/or compose (docker-compose.yml/compose.yaml), do NOT modify them. Instead, generate a wrapper (in autodeploy.compose.yml) compose that runs docker-in-docker (image: docker:27-dind or docker:stable-dind) with privileged: true, mounts the repo, exposes host port 8080 mapping to the inner app, and executes a setup script (./setup.sh) before invoking the inner project's compose or docker run commands. If analysis shows the app binds to 127.0.0.1, the wrapper must ignore the inner compose and instead build and run the app image directly with a command that binds 0.0.0.0 (e.g., gunicorn for Flask) and publish 8080:PORT. "
+    "- Keep in mind repo files are in ./repo. When choosing paths to build the image in compose, consider the compose file you're creating is 1 level above ./repo (refer to the provided tree as this compose file will be found under '../repo', at root level)."
+    "- Here is an example of compose configuration for a simple app: {COMPOSE_TEMPLATE}"
+    "- If you didn't decided to use Docker-in-Docker, then don't use or refer /var/run/docker.sock"
+    "- Generate a compose file that builds the app from available in repo root, maps host 8080 to the app's internal port, and sets PORT env accordingly. Prefer overriding the default run command to ensure the service binds to 0.0.0.0 even if the source code tries to bind 127.0.0.1. For Python/Flask, prefer `gunicorn module:app -b 0.0.0.0:<port>`. "
     "- Ensure the wrapper compose waits for dockerd to be ready before running inner commands. "
-    "- Do NOT use ${PORT} or other ${VAR} expansions in YAML values (Compose substitutes from host). Use $$PORT to defer to the container shell, or hardcode the numeric port provided in context. "
-    "- The output MUST be only the YAML content of autodeploy.compose.yml, no code fences, no comments at top, no explanations. "
-)
+    "- Do NOT use ${{PORT}} or other ${{VAR}} expansions in YAML values (Compose substitutes from host). Use $$PORT to defer to the container shell, or hardcode the numeric port provided in context. "
+    "- To help you determine the paths to mount or working dir, consider the file tree. You are creating the compose configuration that will be run at the tree top level, so choose working_dir and paths to mount repo files in concordance."
+    "- The output MUST be only the YAML content of docker-compose.yml, no code fences, no comments at top, no explanations. "
+"""
 
 LLM_SETUP_SCRIPT_SYSTEM_PROMPT = (
-    "You are a senior DevOps engineer. Generate an idempotent bash setup script (setup.sh) to prepare running the repository's service inside docker-in-docker. "
+    "You are a senior DevOps engineer. Generate an idempotent bash setup script (setup.sh) to prepare running the repository's service(s). "
     "Use signals from the file tree and README to infer necessary steps: creating .env files with sane defaults, running migrations, building assets, generating keys, etc. "
     "Rules: "
+    "- Generate code in this script only if project ABSOLUTELY requires it (instructions in README or presence of .env.example or similar files): set only 'echo \"No setup required\"'."
     "- Shebang: #!/usr/bin/env bash and set -euo pipefail. "
     "- The script MUST be idempotent and safe to run multiple times. "
+    "- Don't rely on virtual envs anywhere because we use Docker."
     "- Create missing .env files and populate required variables with best-effort defaults documented in README/package files. "
     "- If the project uses docker compose already, leave its files intact and do not edit them; only prepare inputs. "
     "- Print progress with echo. "
