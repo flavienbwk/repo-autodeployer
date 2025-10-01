@@ -242,18 +242,15 @@ resource "null_resource" "provision" {{
   provisioner "remote-exec" {{
     inline = [
       "sudo -n sed -i 's|http://[^ ]*ec2.archive.ubuntu.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list || true",
-      "true",
       "sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -y",
-      "sudo -n apt-get install -y ca-certificates curl make gnupg lsb-release",
-      "sudo -n install -m 0755 -d /etc/apt/keyrings",
-      "curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo -n gpg --dearmor -o /etc/apt/keyrings/docker.gpg",
-      "echo \"deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable\" | sudo -n tee /etc/apt/sources.list.d/docker.list > /dev/null",
-      "sudo -n env DEBIAN_FRONTEND=noninteractive apt-get update -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -y",
-      "sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin",
-      "sudo -n usermod -aG docker ubuntu || true",
+      "sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y make curl",
+      "sudo -n env DEBIAN_FRONTEND=noninteractive curl -fsSL https://get.docker.com | sudo sh",
+      "sudo -n groupadd -f docker",
+      "sudo -n usermod -aG docker ubuntu",
+      "sudo -n systemctl enable --now docker || sudo -n service docker start || true",
       "sudo -n mkdir -p /opt/app",
       "sudo -n tar -xzf /home/ubuntu/app.tar.gz -C /opt/",
-      "cd /opt/app && sudo -n make up",
+      "cd /opt/app && sudo -n -E make up",
     ]
   }}
 }}
@@ -268,7 +265,7 @@ LLM_TERRAFORM_SYSTEM_PROMPT_TEMPLATE = (
     "- Provision t2.small in ca-central-1 on Ubuntu 24.04 (Canonical AMI). Ensure the chosen Availability Zone supports this instance type (e.g., prefer ca-central-1a/b); if creating a subnet, set availability_zone accordingly. "
     "- Open ports 22 and 8080 (ingress) and allow all outbound egress (0.0.0.0/0 and ::/0). "
     "- Create an SSH key via tls_private_key ONLY; do NOT use aws_key_pair. "
-    "- In cloud-init user_data, add the public key to the ubuntu user's authorized keys using exact Terraform interpolation ${tls_private_key.ssh.public_key_openssh} (single pair of braces), and ensure passwordless sudo: set groups: [sudo] and sudo: \"ALL=(ALL) NOPASSWD:ALL\" for the ubuntu user. "
+    "- In cloud-init user_data, add the public key to the ubuntu user's authorized keys using exact Terraform interpolation ${{tls_private_key.ssh.public_key_openssh}} (single pair of braces), and ensure passwordless sudo: set groups: [sudo] and sudo: \"ALL=(ALL) NOPASSWD:ALL\" for the ubuntu user. "
     "- For networking, ensure outbound internet: attach the instance to a public subnet with an Internet Gateway and route 0.0.0.0/0 to the IGW. The local route for the VPC CIDR (e.g., 10.0.0.0/16) is implicit in AWS route tables; do not try to create it. If a default VPC/subnet isn’t available, create a minimal VPC + public subnet + IGW + route table + association, and enable DNS support/hostnames on the VPC. "
     "- For Security Groups, DO NOT set a fixed 'name'. Instead set name_prefix = \"autodeployer-sg-\" to avoid duplicate name errors. "
     "- Upload a provided app.tar.gz to /home/ubuntu/app.tar.gz using file provisioner. "
@@ -279,7 +276,8 @@ LLM_TERRAFORM_SYSTEM_PROMPT_TEMPLATE = (
     "- Avoid any data sources or resources that require ec2:DescribeKeyPairs or RevokeSecurityGroupEgress. "
     "- Use this AMI data block verbatim to look up Canonical Ubuntu 24.04 in any region: \n\n"
     "```hcl\n{ami_data_snippet}\n```\n\n"
-    "Reference it as: ami = data.aws_ami.ubuntu.id. Output only a single main.tf in one fenced code block."
+    "Reference it as: ami = data.aws_ami.ubuntu.id. Output only a single main.tf in one fenced code block. "
+    "When writing inline remote-exec command lists in HCL, ensure any inner double quotes are escaped as \\\" (e.g., echo \\\"...\\\")."
 )
 
 LLM_DOCKERFILE_SYSTEM_PROMPT = (

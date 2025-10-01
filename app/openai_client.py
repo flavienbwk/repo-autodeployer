@@ -13,7 +13,8 @@ _logger = logging.getLogger("openai_client")
 
 def generate_terraform_from_llm(prompt: Dict[str, Any]) -> str:
     api_key = os.environ.get("OPENAI_API_KEY")
-    model = os.environ.get("OPENAI_MODEL", "gpt-5-mini-2025-08-07")
+    # Use a stable default model unless explicitly overridden
+    model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not set")
 

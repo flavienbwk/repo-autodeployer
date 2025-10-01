@@ -9,7 +9,11 @@ from typing import List, Optional
 import logging
 from .queue import JobManager
 from .openai_client import generate_terraform_from_llm, generate_dockerfile_from_llm
-from .constants import AMI_DATA_SNIPPET
+from .constants import (
+    DEFAULT_AWS_INSTANCE,
+    DRY_TERRAFORM_DEPLOYS,
+    AMI_DATA_SNIPPET
+)
 from .templates import (
     DOCKERFILE_FALLBACK_TEMPLATE,
     COMPOSE_TEMPLATE,
@@ -17,9 +21,6 @@ from .templates import (
     TERRAFORM_HINTS_TEMPLATE,
     TERRAFORM_FALLBACK_TEMPLATE,
 )
-
-DEFAULT_AWS_INSTANCE = "t2.small"
-DRY_TERRAFORM_DEPLOYS = True if os.environ.get("DRY_TERRAFORM_DEPLOYS", "true") == "true" else False
 
 def run(cmd: List[str], cwd: Optional[str], log: logging.Logger):
     proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -243,11 +244,21 @@ TERRAFORM_HINTS = TERRAFORM_HINTS_TEMPLATE.format(instance_type=DEFAULT_AWS_INST
 
 def terraform_fallback_main_tf(name_suffix: str) -> str:
     # Fallback Terraform minimizing IAM requirements: no aws_key_pair, no SG egress management
-  return TERRAFORM_FALLBACK_TEMPLATE.format(
-    instance_type=DEFAULT_AWS_INSTANCE,
-    name_suffix=name_suffix,
-    ami_data_snippet=AMI_DATA_SNIPPET,
-  )
+    tf = TERRAFORM_FALLBACK_TEMPLATE.format(
+        instance_type=DEFAULT_AWS_INSTANCE,
+        name_suffix=name_suffix,
+        ami_data_snippet=AMI_DATA_SNIPPET,
+    )
+    # Ensure Docker service is started before attempting compose usage
+    try:
+        tf = re.sub(
+            r'("cd /opt/app && sudo -n make up",)',
+            '"sudo -n systemctl enable --now docker",\n      \\1',
+            tf,
+        )
+    except Exception:
+        pass
+    return tf
 
 
 def extract_code_block(text: str) -> str:
@@ -281,7 +292,23 @@ def is_llm_tf_acceptable(code: str) -> bool:
         return False
     if "user_data" not in code_l:
         return False
+    # Require our target instance family to reduce surprises
     if DEFAULT_AWS_INSTANCE not in code_l:
+        return False
+    # Must provision via file + remote-exec with ubuntu user
+    if "provisioner \"remote-exec\"" not in code_l or "provisioner \"file\"" not in code_l:
+        return False
+    if 'user        = "ubuntu"' not in code:
+        return False
+    # Prefer robust apt usage and docker compose plugin installation
+    if "acquire::forceipv4=true" not in code_l:
+        return False
+    if "docker-compose-plugin" not in code_l and "docker compose" not in code_l:
+        return False
+    # Must upload to /home/ubuntu/app.tar.gz and run make up
+    if "/home/ubuntu/app.tar.gz" not in code:
+        return False
+    if "make up" not in code_l:
         return False
     return True
 
@@ -346,6 +373,15 @@ def process_deploy_request(job_manager: JobManager, job_id: str, description: st
     if not main_tf:
         short_id = (job_id.split("-")[0] or job_id)[:8]
         main_tf = terraform_fallback_main_tf(short_id)
+        # Also ensure Docker service start in fallback (defense in depth)
+        try:
+            main_tf = re.sub(
+                r'("cd /opt/app && sudo -n make up",)',
+                '"sudo -n systemctl enable --now docker",\n      \\1',
+                main_tf,
+            )
+        except Exception:
+            pass
 
     with open(os.path.join(terraform_dir, "main.tf"), "w") as f:
         f.write(main_tf)

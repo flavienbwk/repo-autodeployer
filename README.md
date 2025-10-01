@@ -55,9 +55,12 @@ Also find:
 
 ## Features
 
+- Versatile containerized deployments ;
+- Auto-generated TF and Docker configuration ;
 - Secure connectivity to EC2 intances through individual SSH keys ;
 - Proper logging system ;
 - Versatile (Docker) packaging ;
 - Secure resources consumption and limits ;
 - LLM failovers if LLM generates invalid TF files ;
-- Preventing LLM prompts injection with auto-generated delimiters.
+- Preventing LLM prompts injection with auto-generated delimiters ;
+- Queued multi-workers pool.
